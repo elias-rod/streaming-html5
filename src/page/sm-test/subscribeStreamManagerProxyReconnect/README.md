@@ -1,4 +1,6 @@
-# Subscribing RTC Streams over stream manager proxy
+# Subscribe Failover & Reconnection through Stream Manager Proxy
+
+This is an example of utilizing the failover mechanism of the Red5 Pro HTML SDK to select a subscriber based on browser support and to reconnect on close of broadcast or loss of connection.
 
 The streammanager WebRTC proxy is a communication layer built inside streammanager web application which allows it to act as a proxy gateway for webrtc publishers / subscribers. The target use case of this communication layer is to facilitate a secure browser client to be able to connect to a "unsecure" remote websocket endpoint for consuming WebRTC services offered by Red5pro. 
 
@@ -31,7 +33,7 @@ function requestEdge (configuration) {
   var portURI = (port.length > 0 ? ':' + port : '');
   var baseUrl = isSecure ? protocol + '://' + host : protocol + '://' + host + portURI;
   var streamName = configuration.stream1;
-  var apiVersion = configuration.streamManagerAPI || '3.1';
+  var apiVersion = configuration.streamManagerAPI || '4.0';
   var url = baseUrl + '/streammanager/api/' + apiVersion + '/event/' + app + '/' + streamName + '?action=subscribe';
   return new Promise(function (resolve, reject) {
     fetch(url)
@@ -130,3 +132,40 @@ function determineSubscriber (serverAddress) {
 
 [index.js #126](index.js#L126)
 
+## Reconnection Logic
+
+# Implementation
+
+Use the events API to determine when to kick off a reconnection request - typically these will be the following events:
+
+* `Subscribe.Unpublish` - When the broadcast being consumed has stopped.
+* `Subscribe.Connection.Closed` - When a previously established connection to a broadcast stream has closed. This can occur during Network loss or an Edge being removed.
+
+At the point of failure in establishing an initial connection and when a previously established connection/stream is lost, a call to set its connection state to false is invoked:
+
+```js
+function setConnected (value) {
+  connected = value;
+  if (!connected) {
+    if (targetSubscriber) {
+      targetSubscriber.off('*', onSubscriberEvent);
+    }
+    unsubscribe()
+    targetSubscriber = undefined;
+    retryConnect();
+  }
+}
+```
+
+If a previously established subscriber is existant, it will tear it down, and continue on to invoke `retryConnect()`.
+
+A call to `startup` is set on a timeout and upon failure in being able to connect to a broadcast, the timeout is started over:
+
+```js
+function retryConnect () {
+  clearTimeout(retryTimeout);
+  if (!connected) {
+    retryTimeout = setTimeout(startup, 1000)
+  }
+}
+```

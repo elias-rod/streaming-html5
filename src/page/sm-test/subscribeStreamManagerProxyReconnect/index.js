@@ -62,7 +62,6 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     window.red5proHandleSubscriberEvent(event); // defined in src/template/partial/status-field-subscriber.hbs
   };
   var proxyLocal = window.query('local')
-  var instanceId = Math.floor(Math.random() * 0x10000).toString(16);
   var streamTitle = document.getElementById('stream-title');
   var statisticsField = document.getElementById('statistics-field');
   var bitrateField = document.getElementById('bitrate-field');
@@ -147,7 +146,10 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     updateStatusFromEvent(event);
     if (event.type === 'Subscribe.VideoDimensions.Change') {
       onResolutionUpdate(event.data.width, event.data.height);
-    }  
+    } else if (event.type === 'Subscribe.Play.Unpublish' ||
+      event.type === 'Subscribe.Connection.Closed') {
+      setConnected(false);
+    }
   }
   function onSubscribeFail (message) {
     console.error('[Red5ProSubsriber] Subscribe Error :: ' + message);
@@ -173,50 +175,49 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
     console.log('[Red5ProSubsriber] Unsubscribe Complete.');
   }
 
+  function getRegionIfDefined () {
+    var region = configuration.streamManagerRegion;
+    if (typeof region === 'string' && region.length > 0 && region !== 'undefined') {
+      return region;
+    }
+    return undefined
+  }
+
   function requestEdge (configuration) {
     var host = configuration.host;
     var app = configuration.app;
     var port = serverSettings.httpport;
     var baseUrl = protocol + '://' + host + ':' + port;
     var streamName = configuration.stream1;
-    var apiVersion = configuration.streamManagerAPI || '3.1';
-    var region = configuration.streamManagerRegion;
-    var url = baseUrl + '/streammanager/api/' + apiVersion + '/event/' + app + '/' + streamName + '?action=subscribe' + '&region=' + region;
+    var apiVersion = configuration.streamManagerAPI || '4.0';
+    var url = baseUrl + '/streammanager/api/' + apiVersion + '/event/' + app + '/' + streamName + '?action=subscribe';
+    var region = getRegionIfDefined();
+    if (region) {
+      url += '&region=' + region;
+    }
       return new Promise(function (resolve, reject) {
         fetch(url)
           .then(function (res) {
             if(res.status == 200){
                 if (res.headers.get("content-type") && res.headers.get("content-type").toLowerCase().indexOf("application/json") >= 0) {
                     return res.json();
-                }
-                else {
+                } else {
                     throw new TypeError('Could not properly parse response.');
                 }
+            } else {
+              var msg = "";
+              if(res.status == 400) {
+                msg = "An invalid request was detected";
+              } else if(res.status == 404) {
+                msg = "Data for the request could not be located/provided.";
+              } else if(res.status == 500) {
+                msg = "Improper server state error was detected.";
+              } else {
+                msg = "Unkown error";
+              }
+              throw new TypeError(msg);
             }
-            else{
-				var msg = "";
-				if(res.status == 400)
-				{
-					msg = "An invalid request was detected";
-				}
-				else if(res.status == 404)
-				{
-					msg = "Data for the request could not be located/provided.";
-				}
-				else if(res.status == 500)
-				{
-					msg = "Improper server state error was detected.";
-				}
-				else
-				{
-					msg = "Unkown error";
-				}
-					
-				
-				throw new TypeError(msg);
-			}
 
-            
           })
           .then(function (json) {
             resolve(json);
@@ -243,7 +244,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
         host: host,
         app: app
       },
-      subscriptionId: 'subscriber-' + instanceId,
+      subscriptionId: 'subscriber-' + (Math.floor(Math.random() * 0x10000).toString(16)),
       streamName: config.stream1
     });
     var rtmpConfig = Object.assign({}, config, {
@@ -322,23 +323,25 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
   function unsubscribe () {
     return new Promise(function(resolve, reject) {
       var subscriber = targetSubscriber
-      subscriber.unsubscribe()
-        .then(function () {
-          targetSubscriber.off('*', onSubscriberEvent);
-          targetSubscriber = undefined;
-          onUnsubscribeSuccess();
-          resolve();
-        })
-        .catch(function (error) {
-          var jsonError = typeof error === 'string' ? error : JSON.stringify(error, null, 2);
-          onUnsubscribeFail(jsonError);
-          reject(error);
-        });
+      if (subscriber) {
+        subscriber.unsubscribe()
+          .then(function () {
+            targetSubscriber.off('*', onSubscriberEvent);
+            targetSubscriber = undefined;
+            onUnsubscribeSuccess();
+            resolve();
+          })
+          .catch(function (error) {
+            var jsonError = typeof error === 'string' ? error : JSON.stringify(error, null, 2);
+            onUnsubscribeFail(jsonError);
+            reject(error);
+          });
+      } else {
+        resolve()
+      }
     });
   }
 
-  var retryCount = 0;
-  var retryLimit = 3;
   function respondToEdge (response) {
     determineSubscriber(response)
       .then(function (subscriberImpl) {
@@ -351,33 +354,49 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
       })
       .then(function (sub) {
         onSubscribeSuccess(sub);
+        setConnected(true)
       })
       .catch(function (error) {
         var jsonError = typeof error === 'string' ? error : JSON.stringify(error, null, 2);
         console.error('[Red5ProSubscriber] :: Error in subscribing - ' + jsonError);
         onSubscribeFail(jsonError);
+        setConnected(false)
       });
   }
 
   function respondToEdgeFailure (error) {
-    if (retryCount++ < retryLimit) {
-      var retryTimer = setTimeout(function () {
-        clearTimeout(retryTimer);
-        startup();
-      }, 1000);
-    }
-    else {
-      var jsonError = typeof error === 'string' ? error : JSON.stringify(error, null, 2);
-      console.error('[Red5ProSubscriber] :: Retry timeout in subscribing - ' + jsonError);
-    }
+    console.error(error)
+    setConnected(false)
   }
 
   function startup () {
     // Kick off.
+    clearTimeout(retryTimeout);
     requestEdge(configuration)
       .then(respondToEdge)
       .catch(respondToEdgeFailure);
   }
+
+  var retryTimeout;
+  var connected = false;
+  function retryConnect () {
+    clearTimeout(retryTimeout);
+    if (!connected) {
+      retryTimeout = setTimeout(startup, 1000)
+    }
+  }
+  function setConnected (value) {
+    connected = value;
+    if (!connected) {
+      if (targetSubscriber) {
+        targetSubscriber.off('*', onSubscriberEvent);
+      }
+      unsubscribe()
+      targetSubscriber = undefined;
+      retryConnect();
+    }
+  }
+
   startup();
 
   // Clean up.
